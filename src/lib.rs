@@ -1,6 +1,4 @@
 use anyhow::{Context, Result};
-use futures::{stream::FuturesUnordered, StreamExt};
-use lazy_static::lazy_static;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,11 +15,9 @@ mod lock;
 use lock::LockFile;
 
 const WALLHEAVEN_API: &str = "https://wallhaven.cc/api/v1/w";
+const MAX_RETRY: u32 = 3;
 
-lazy_static! {
-    static ref MAX_RETRY: u32 = 3;
-}
-
+/// Main RustPaper struct for managing wallpapers
 #[derive(Clone)]
 pub struct RustPaper {
     config: config::Config,
@@ -32,6 +28,7 @@ pub struct RustPaper {
 }
 
 impl RustPaper {
+    /// Create a new RustPaper instance with loaded configuration
     pub async fn new() -> Result<Self> {
         let config: config::Config =
             confy::load("rust-paper", "config").context("   Failed to load configuration")?;
@@ -46,19 +43,26 @@ impl RustPaper {
         let wallpapers_list_file_location = config_folder.join("wallpapers.lst");
         let wallpapers = load_wallpapers(&wallpapers_list_file_location).await?;
 
-        let lock_file = Arc::new(Mutex::new(config.integrity.then(LockFile::default)));
+        let lock_file = if config.integrity {
+            Some(LockFile::load_or_new().await)
+        } else {
+            None
+        };
 
         Ok(Self {
             config,
             config_folder,
             wallpapers,
             wallpapers_list_file_location,
-            lock_file,
+            lock_file: Arc::new(Mutex::new(lock_file)),
         })
     }
 
+    /// Sync all wallpapers in the list
     pub async fn sync(&self) -> Result<()> {
-        let tasks: FuturesUnordered<_> = self
+        use tokio::task::JoinHandle;
+        
+        let handles: Vec<JoinHandle<Result<()>>> = self
             .wallpapers
             .iter()
             .map(|wallpaper| {
@@ -66,23 +70,22 @@ impl RustPaper {
                 let lock_file = Arc::clone(&self.lock_file);
                 let wallpaper = wallpaper.clone();
 
-                tokio::spawn(
-                    async move { process_wallpaper(&config, &lock_file, &wallpaper).await },
-                )
+                tokio::spawn(async move {
+                    process_wallpaper(&config, &lock_file, &wallpaper).await
+                })
             })
             .collect();
 
-        tasks
-            .for_each(|result| async {
-                if let Err(e) = result.expect("Task panicked") {
-                    eprintln!("   Error processing wallpaper: {}", e);
-                }
-            })
-            .await;
+        for handle in handles {
+            if let Err(e) = handle.await.expect("Task panicked") {
+                eprintln!("  Error processing wallpaper: {}", e);
+            }
+        }
 
         Ok(())
     }
 
+    /// Add new wallpapers to the list
     pub async fn add(&mut self, new_wallpapers: &mut Vec<String>) -> Result<()> {
         *new_wallpapers = new_wallpapers
             .iter()
@@ -101,14 +104,24 @@ impl RustPaper {
             })
             .collect();
 
-        self.wallpapers
-            .extend(new_wallpapers.iter().flat_map(|s| helper::to_array(s)));
+        // Validate wallpaper IDs
+        let mut valid_wallpapers = Vec::new();
+        for wallpaper in new_wallpapers.iter().flat_map(|s| helper::to_array(s)) {
+            if helper::validate_wallpaper_id(&wallpaper) {
+                valid_wallpapers.push(wallpaper);
+            } else {
+                eprintln!("  Warning: Invalid wallpaper ID format '{}', skipping", wallpaper);
+            }
+        }
+
+        self.wallpapers.extend(valid_wallpapers);
         self.wallpapers.sort_unstable();
         self.wallpapers.dedup();
         update_wallpaper_list(&self.wallpapers, &self.wallpapers_list_file_location).await
     }
 }
 
+/// Update the wallpaper list file with the given list of wallpapers
 async fn update_wallpaper_list(list: &[String], file_given: impl AsRef<Path>) -> Result<()> {
     let file_path = file_given.as_ref();
     let file = OpenOptions::new()
@@ -165,10 +178,12 @@ async fn process_wallpaper(
     let image_location = download_and_save(&res, wallpaper, &config.save_location).await?;
 
     if config.integrity {
-        let mut lock_file = lock_file.lock().await;
-        if let Some(ref mut lock_file) = *lock_file {
+        let mut lock_file_guard = lock_file.lock().await;
+        if let Some(ref mut lock_file) = *lock_file_guard {
             let image_sha256 = helper::calculate_sha256(&image_location).await?;
-            lock_file.add(wallpaper.to_string(), image_location, image_sha256)?;
+            lock_file
+                .add(wallpaper.to_string(), image_location, image_sha256)
+                .await?;
         }
     }
 
@@ -176,6 +191,7 @@ async fn process_wallpaper(
     Ok(())
 }
 
+/// Load wallpaper IDs from a file
 async fn load_wallpapers(given_file: impl AsRef<Path>) -> Result<Vec<String>> {
     let file_path = given_file.as_ref();
     if !file_path.exists() {
@@ -195,6 +211,7 @@ async fn load_wallpapers(given_file: impl AsRef<Path>) -> Result<Vec<String>> {
     Ok(lines)
 }
 
+/// Find an existing image file for a wallpaper ID
 async fn find_existing_image(
     save_location_given: impl AsRef<Path>,
     wallpaper: &str,
@@ -210,14 +227,15 @@ async fn find_existing_image(
     Ok(None)
 }
 
+/// Check if an existing image matches the integrity hash
 async fn check_integrity(
     existing_path_given: impl AsRef<Path>,
     wallpaper: &str,
     lock_file: &Arc<Mutex<Option<LockFile>>>,
 ) -> Result<bool> {
     let existing_path = existing_path_given.as_ref();
-    let lock_file = lock_file.lock().await;
-    if let Some(ref lock_file) = *lock_file {
+    let lock_file_guard = lock_file.lock().await;
+    if let Some(ref lock_file) = *lock_file_guard {
         let existing_image_sha256 = helper::calculate_sha256(existing_path).await?;
         Ok(lock_file.contains(wallpaper, &existing_image_sha256))
     } else {
@@ -225,6 +243,7 @@ async fn check_integrity(
     }
 }
 
+/// Download and save an image from API data
 async fn download_and_save(api_data: &Value, id: &str, save_location: &str) -> Result<String> {
     let img_link = api_data
         .get("data")
@@ -234,17 +253,21 @@ async fn download_and_save(api_data: &Value, id: &str, save_location: &str) -> R
     helper::download_image(&img_link, id, save_location).await
 }
 
+/// Retry fetching content from a URL with exponential backoff
 async fn retry_get_curl_content(url: &str) -> Result<String> {
-    for retry_count in 0..*MAX_RETRY {
+    for retry_count in 0..MAX_RETRY {
         match helper::get_curl_content(url).await {
             Ok(content) => return Ok(content),
-            Err(e) if retry_count + 1 < *MAX_RETRY => {
+            Err(e) if retry_count + 1 < MAX_RETRY => {
+                let delay = 2_u64.pow(retry_count); // Exponential backoff
                 eprintln!(
-                    "Error fetching content (attempt {}): {}. Retrying...",
+                    "Error fetching content (attempt {} of {}): {}. Retrying in {}s...",
                     retry_count + 1,
-                    e
+                    MAX_RETRY,
+                    e,
+                    delay
                 );
-                sleep(Duration::from_secs(1)).await;
+                sleep(Duration::from_secs(delay)).await;
             }
             Err(e) => return Err(e),
         }

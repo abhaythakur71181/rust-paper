@@ -3,9 +3,12 @@ use std::default::Default;
 
 use crate::helper;
 
+/// Configuration for Rust Paper
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
+    /// Directory where wallpapers will be saved
     pub save_location: String,
+    /// Whether to enable integrity checks using SHA256
     pub integrity: bool,
 }
 
