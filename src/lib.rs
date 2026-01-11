@@ -184,6 +184,80 @@ impl RustPaper {
 
         Ok(())
     }
+
+    /// List all tracked wallpapers with their download status
+    pub async fn list(&self) -> Result<()> {
+        if self.wallpapers.is_empty() {
+            println!("  No wallpapers tracked.");
+            return Ok(());
+        }
+
+        println!("  Tracked wallpapers ({} total):", self.wallpapers.len());
+        println!();
+
+        let mut downloaded_count = 0;
+        let mut not_downloaded_count = 0;
+
+        for wallpaper_id in &self.wallpapers {
+            let status = check_download_status(&self.config.save_location, wallpaper_id, &self.lock_file).await?;
+            
+            match status {
+                WallpaperStatus::Downloaded { path } => {
+                    println!("  ✓ {} - Downloaded ({})", wallpaper_id, path.display());
+                    downloaded_count += 1;
+                }
+                WallpaperStatus::DownloadedWithIntegrity { path } => {
+                    println!("  ✓ {} - Downloaded (verified) ({})", wallpaper_id, path.display());
+                    downloaded_count += 1;
+                }
+                WallpaperStatus::NotDownloaded => {
+                    println!("  ○ {} - Not downloaded", wallpaper_id);
+                    not_downloaded_count += 1;
+                }
+            }
+        }
+
+        println!();
+        println!(
+            "  Summary: {} downloaded, {} not downloaded",
+            downloaded_count,
+            not_downloaded_count
+        );
+
+        Ok(())
+    }
+}
+
+/// Status of a wallpaper
+enum WallpaperStatus {
+    Downloaded { path: PathBuf },
+    DownloadedWithIntegrity { path: PathBuf },
+    NotDownloaded,
+}
+
+/// Check the download status of a wallpaper
+async fn check_download_status(
+    save_location: &str,
+    wallpaper_id: &str,
+    lock_file: &Arc<Mutex<Option<LockFile>>>,
+) -> Result<WallpaperStatus> {
+    if let Some(existing_path) = find_existing_image(save_location, wallpaper_id).await? {
+        // Check if integrity is enabled and verified
+        let lock_file_guard = lock_file.lock().await;
+        if let Some(ref lock_file) = *lock_file_guard {
+            if let Ok(existing_image_sha256) = helper::calculate_sha256(&existing_path).await {
+                if lock_file.contains(wallpaper_id, &existing_image_sha256) {
+                    return Ok(WallpaperStatus::DownloadedWithIntegrity { path: existing_path });
+                }
+            }
+            // File exists but integrity check failed or not in lock file
+            return Ok(WallpaperStatus::Downloaded { path: existing_path });
+        }
+        // File exists but integrity is not enabled
+        Ok(WallpaperStatus::Downloaded { path: existing_path })
+    } else {
+        Ok(WallpaperStatus::NotDownloaded)
+    }
 }
 
 /// Update the wallpaper list file with the given list of wallpapers

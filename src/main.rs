@@ -22,6 +22,7 @@ enum Command {
         #[arg(required = true)]
         ids: Vec<String>,
     },
+    List,
 }
 
 #[tokio::main]
@@ -37,6 +38,9 @@ async fn main() -> Result<(), Error> {
         }
         Command::Remove { ids } => {
             rust_paper.remove(&ids).await?;
+        }
+        Command::List => {
+            rust_paper.list().await?;
         }
     }
 
