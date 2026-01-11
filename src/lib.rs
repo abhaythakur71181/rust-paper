@@ -119,6 +119,71 @@ impl RustPaper {
         self.wallpapers.dedup();
         update_wallpaper_list(&self.wallpapers, &self.wallpapers_list_file_location).await
     }
+
+    /// Remove wallpapers from the list
+    pub async fn remove(&mut self, ids_to_remove: &[String]) -> Result<()> {
+        // Extract and validate wallpaper IDs (support URLs and comma-separated)
+        let ids: Vec<String> = ids_to_remove
+            .iter()
+            .flat_map(|id| {
+                let processed = if helper::is_url(id) {
+                    id.split('/')
+                        .last()
+                        .unwrap_or_default()
+                        .split('?')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string()
+                } else {
+                    id.clone()
+                };
+                helper::to_array(&processed)
+            })
+            .filter(|id| helper::validate_wallpaper_id(id))
+            .collect();
+
+        if ids.is_empty() {
+            return Err(anyhow::anyhow!("No valid wallpaper IDs provided"));
+        }
+
+        // Track what was removed
+        let original_len = self.wallpapers.len();
+
+        // Remove IDs from the list
+        self.wallpapers.retain(|id| !ids.contains(id));
+
+        let removed_count = original_len - self.wallpapers.len();
+
+        if removed_count == 0 {
+            println!("  No matching wallpaper IDs found in the list");
+            return Ok(());
+        }
+
+        // Update the wallpapers list file
+        update_wallpaper_list(&self.wallpapers, &self.wallpapers_list_file_location).await?;
+
+        // Optionally remove from lock file if integrity is enabled
+        if self.config.integrity {
+            let mut lock_file_guard = self.lock_file.lock().await;
+            if let Some(ref mut lock_file) = *lock_file_guard {
+                for id in &ids {
+                    lock_file.remove(id).await?;
+                }
+            }
+        }
+
+        if removed_count == ids.len() {
+            println!("  Removed {} wallpaper ID(s) from the list", removed_count);
+        } else {
+            println!(
+                "  Removed {} of {} requested wallpaper ID(s) from the list",
+                removed_count,
+                ids.len()
+            );
+        }
+
+        Ok(())
+    }
 }
 
 /// Update the wallpaper list file with the given list of wallpapers

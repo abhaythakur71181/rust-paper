@@ -221,4 +221,23 @@ mod tests {
         assert_eq!(get_img_extension(&ImageFormat::Gif), "gif");
         assert_eq!(get_img_extension(&ImageFormat::WebP), "webp");
     }
+
+    #[test]
+    fn test_remove_url_extraction() {
+        // Test that URLs are correctly parsed to extract wallpaper IDs
+        let url = "https://wallhaven.cc/w/7pmgv9";
+        let processed = if is_url(url) {
+            url.split('/')
+                .last()
+                .unwrap_or_default()
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            url.to_string()
+        };
+        assert_eq!(processed, "7pmgv9");
+        assert!(validate_wallpaper_id(&processed));
+    }
 }
