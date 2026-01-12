@@ -23,6 +23,11 @@ enum Command {
         ids: Vec<String>,
     },
     List,
+    Clean,
+    Info {
+        #[arg(required = true)]
+        id: String,
+    },
 }
 
 #[tokio::main]
@@ -41,6 +46,12 @@ async fn main() -> Result<(), Error> {
         }
         Command::List => {
             rust_paper.list().await?;
+        }
+        Command::Clean => {
+            rust_paper.clean().await?;
+        }
+        Command::Info { id } => {
+            rust_paper.info(&id).await?;
         }
     }
 

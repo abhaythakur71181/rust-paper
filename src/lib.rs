@@ -61,7 +61,7 @@ impl RustPaper {
     /// Sync all wallpapers in the list
     pub async fn sync(&self) -> Result<()> {
         use tokio::task::JoinHandle;
-        
+
         let handles: Vec<JoinHandle<Result<()>>> = self
             .wallpapers
             .iter()
@@ -70,9 +70,9 @@ impl RustPaper {
                 let lock_file = Arc::clone(&self.lock_file);
                 let wallpaper = wallpaper.clone();
 
-                tokio::spawn(async move {
-                    process_wallpaper(&config, &lock_file, &wallpaper).await
-                })
+                tokio::spawn(
+                    async move { process_wallpaper(&config, &lock_file, &wallpaper).await },
+                )
             })
             .collect();
 
@@ -110,7 +110,10 @@ impl RustPaper {
             if helper::validate_wallpaper_id(&wallpaper) {
                 valid_wallpapers.push(wallpaper);
             } else {
-                eprintln!("  Warning: Invalid wallpaper ID format '{}', skipping", wallpaper);
+                eprintln!(
+                    "  Warning: Invalid wallpaper ID format '{}', skipping",
+                    wallpaper
+                );
             }
         }
 
@@ -199,15 +202,21 @@ impl RustPaper {
         let mut not_downloaded_count = 0;
 
         for wallpaper_id in &self.wallpapers {
-            let status = check_download_status(&self.config.save_location, wallpaper_id, &self.lock_file).await?;
-            
+            let status =
+                check_download_status(&self.config.save_location, wallpaper_id, &self.lock_file)
+                    .await?;
+
             match status {
                 WallpaperStatus::Downloaded { path } => {
                     println!("  ✓ {} - Downloaded ({})", wallpaper_id, path.display());
                     downloaded_count += 1;
                 }
                 WallpaperStatus::DownloadedWithIntegrity { path } => {
-                    println!("  ✓ {} - Downloaded (verified) ({})", wallpaper_id, path.display());
+                    println!(
+                        "  ✓ {} - Downloaded (verified) ({})",
+                        wallpaper_id,
+                        path.display()
+                    );
                     downloaded_count += 1;
                 }
                 WallpaperStatus::NotDownloaded => {
@@ -220,9 +229,166 @@ impl RustPaper {
         println!();
         println!(
             "  Summary: {} downloaded, {} not downloaded",
-            downloaded_count,
-            not_downloaded_count
+            downloaded_count, not_downloaded_count
         );
+
+        Ok(())
+    }
+
+    /// Clean up downloaded wallpapers that are no longer in the list
+    pub async fn clean(&mut self) -> Result<()> {
+        let save_location = Path::new(&self.config.save_location);
+        if !save_location.exists() {
+            println!(
+                "  Save location does not exist: {}",
+                save_location.display()
+            );
+            return Ok(());
+        }
+        let mut entries = tokio::fs::read_dir(save_location).await?;
+        let mut removed_count = 0;
+        let mut total_size = 0u64;
+        let mut files_to_check = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    files_to_check.push((path.clone(), file_stem.to_string()));
+                }
+            }
+        }
+        println!(
+            "  Checking {} file(s) in save location...",
+            files_to_check.len()
+        );
+        for (file_path, file_stem) in files_to_check {
+            if !self.wallpapers.contains(&file_stem) {
+                if let Ok(metadata) = tokio::fs::metadata(&file_path).await {
+                    total_size += metadata.len();
+                }
+                if self.config.integrity {
+                    let mut lock_file_guard = self.lock_file.lock().await;
+                    if let Some(ref mut lock_file) = *lock_file_guard {
+                        lock_file.remove(&file_stem).await?;
+                    }
+                }
+                match tokio::fs::remove_file(&file_path).await {
+                    Ok(_) => {
+                        println!("  Removed: {} ({})", file_stem, file_path.display());
+                        removed_count += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("  Error removing {}: {}", file_path.display(), e);
+                    }
+                }
+            }
+        }
+
+        if removed_count == 0 {
+            println!("  No orphaned files found. Everything is clean!");
+        } else {
+            println!();
+            println!(
+                "  Cleaned up {} file(s), freed approximately {:.2} MB",
+                removed_count,
+                total_size as f64 / 1_048_576.0
+            );
+        }
+
+        Ok(())
+    }
+
+    pub async fn info(&self, id: &str) -> Result<()> {
+        let wallpaper_id = if helper::is_url(id) {
+            id.split('/')
+                .last()
+                .unwrap_or_default()
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            id.to_string()
+        };
+
+        if !helper::validate_wallpaper_id(&wallpaper_id) {
+            return Err(anyhow::anyhow!(
+                "Invalid wallpaper ID format: '{}'",
+                wallpaper_id
+            ));
+        }
+
+        let api_url = format!("{}/{}", WALLHEAVEN_API, wallpaper_id);
+        let response_data = retry_get_curl_content(&api_url).await?;
+        let json: Value = serde_json::from_str(&response_data)?;
+        if let Some(error) = json.get("error") {
+            return Err(anyhow::anyhow!("API error: {}", error));
+        }
+        if let Some(data) = json.get("data") {
+            println!("  Wallpaper Information:");
+            println!("  ─────────────────────");
+            if let Some(id_val) = data.get("id").and_then(Value::as_str) {
+                println!("  ID: {}", id_val);
+            }
+            if let Some(url) = data.get("url").and_then(Value::as_str) {
+                println!("  URL: {}", url);
+            }
+            if let Some(width) = data.get("resolution").and_then(Value::as_str) {
+                println!("  Resolution: {}", width);
+            }
+            if let Some(size) = data.get("file_size").and_then(Value::as_u64) {
+                println!("  File Size: {:.2} MB", size as f64 / 1_048_576.0);
+            }
+            if let Some(category) = data.get("category").and_then(Value::as_str) {
+                println!("  Category: {}", category);
+            }
+            if let Some(purity) = data.get("purity").and_then(Value::as_str) {
+                println!("  Purity: {}", purity);
+            }
+            if let Some(views) = data.get("views").and_then(Value::as_u64) {
+                println!("  Views: {}", views);
+            }
+            if let Some(favorites) = data.get("favorites").and_then(Value::as_u64) {
+                println!("  Favorites: {}", favorites);
+            }
+            if let Some(date) = data.get("created_at").and_then(Value::as_str) {
+                println!("  Uploaded: {}", date);
+            }
+            if let Some(uploader) = data.get("uploader") {
+                if let Some(username) = uploader.get("username").and_then(Value::as_str) {
+                    println!("  Uploader: {}", username);
+                }
+            }
+            if let Some(tags) = data.get("tags").and_then(Value::as_array) {
+                if !tags.is_empty() {
+                    let tag_names: Vec<String> = tags
+                        .iter()
+                        .filter_map(|tag| tag.get("name").and_then(Value::as_str))
+                        .map(String::from)
+                        .collect();
+                    if !tag_names.is_empty() {
+                        println!("  Tags: {}", tag_names.join(", "));
+                    }
+                }
+            }
+            if let Some(path) = data.get("path").and_then(Value::as_str) {
+                println!("  Image URL: {}", path);
+            }
+            if self.wallpapers.contains(&wallpaper_id) {
+                println!("  Status: Tracked");
+                if let Some(local_path) =
+                    find_existing_image(&self.config.save_location, &wallpaper_id).await?
+                {
+                    println!("  Local: {}", local_path.display());
+                } else {
+                    println!("  Local: Not downloaded");
+                }
+            } else {
+                println!("  Status: Not tracked");
+            }
+        } else {
+            return Err(anyhow::anyhow!("Invalid API response: no data field"));
+        }
 
         Ok(())
     }
@@ -247,14 +413,20 @@ async fn check_download_status(
         if let Some(ref lock_file) = *lock_file_guard {
             if let Ok(existing_image_sha256) = helper::calculate_sha256(&existing_path).await {
                 if lock_file.contains(wallpaper_id, &existing_image_sha256) {
-                    return Ok(WallpaperStatus::DownloadedWithIntegrity { path: existing_path });
+                    return Ok(WallpaperStatus::DownloadedWithIntegrity {
+                        path: existing_path,
+                    });
                 }
             }
             // File exists but integrity check failed or not in lock file
-            return Ok(WallpaperStatus::Downloaded { path: existing_path });
+            return Ok(WallpaperStatus::Downloaded {
+                path: existing_path,
+            });
         }
         // File exists but integrity is not enabled
-        Ok(WallpaperStatus::Downloaded { path: existing_path })
+        Ok(WallpaperStatus::Downloaded {
+            path: existing_path,
+        })
     } else {
         Ok(WallpaperStatus::NotDownloaded)
     }

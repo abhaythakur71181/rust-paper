@@ -103,9 +103,7 @@ pub async fn calculate_sha256(file_path: impl AsRef<Path>) -> Result<String> {
 
 /// Download an image from a URL and save it to disk
 pub async fn download_image(url: &str, id: &str, save_location: &str) -> Result<String> {
-    let url = reqwest::Url::parse(url)
-        .context("Invalid image URL")?;
-    
+    let url = reqwest::Url::parse(url).context("Invalid image URL")?;
     let client = get_http_client();
     let response = client
         .get(url)
@@ -126,11 +124,9 @@ pub async fn download_image(url: &str, id: &str, save_location: &str) -> Result<
         .await
         .context("Failed to read image bytes")?;
 
-    let img = load_from_memory(&img_bytes)
-        .context("Failed to decode image")?;
-    let img_format = guess_format(&img_bytes)
-        .context("Failed to detect image format")?;
-    
+    let img = load_from_memory(&img_bytes).context("Failed to decode image")?;
+    let img_format = guess_format(&img_bytes).context("Failed to detect image format")?;
+
     let image_name = format!(
         "{}/{}.{}",
         save_location,
