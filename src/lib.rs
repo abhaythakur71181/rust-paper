@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +27,51 @@ pub struct RustPaper {
     wallpapers: Vec<String>,
     wallpapers_list_file_location: PathBuf,
     lock_file: Arc<Mutex<Option<LockFile>>>,
+}
+
+/// INFO: Build a map of wallpaper IDs to file paths (cached directory listing)
+async fn build_file_map(save_location: &str) -> Result<HashMap<String, PathBuf>> {
+    let save_path = Path::new(save_location);
+    let mut file_map = HashMap::new();
+    if !save_path.exists() {
+        return Ok(file_map);
+    }
+    let mut entries = tokio::fs::read_dir(save_path).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
+                file_map.insert(file_stem.to_string(), path);
+            }
+        }
+    }
+    Ok(file_map)
+}
+
+async fn process_wallpaper_optimized(
+    config: &config::Config,
+    lock_file: &Arc<Mutex<Option<LockFile>>>,
+    wallpaper: &str,
+) -> Result<()> {
+    let wallhaven_img_link = format!("{}/{}", WALLHEAVEN_API, wallpaper.trim());
+    let curl_data = retry_get_curl_content(&wallhaven_img_link).await?;
+    let res: Value = serde_json::from_str(&curl_data)?;
+    if let Some(error) = res.get("error") {
+        eprintln!("Error : {}", error);
+        return Err(anyhow::anyhow!("❌ API error: {}", error));
+    }
+    let image_location = download_and_save(&res, wallpaper, &config.save_location).await?;
+    if config.integrity {
+        let mut lock_file_guard = lock_file.lock().await;
+        if let Some(ref mut lock_file) = *lock_file_guard {
+            let image_sha256 = helper::calculate_sha256(&image_location).await?;
+            lock_file
+                .add(wallpaper.to_string(), image_location, image_sha256)
+                .await?;
+        }
+    }
+    println!("   Downloaded {}", wallpaper);
+    Ok(())
 }
 
 impl RustPaper {
@@ -60,26 +107,138 @@ impl RustPaper {
 
     /// Sync all wallpapers in the list
     pub async fn sync(&self) -> Result<()> {
-        use tokio::task::JoinHandle;
-
-        let handles: Vec<JoinHandle<Result<()>>> = self
-            .wallpapers
-            .iter()
-            .map(|wallpaper| {
-                let config = self.config.clone();
-                let lock_file = Arc::clone(&self.lock_file);
-                let wallpaper = wallpaper.clone();
-
-                tokio::spawn(
-                    async move { process_wallpaper(&config, &lock_file, &wallpaper).await },
+        let file_map = build_file_map(&self.config.save_location).await?;
+        let lock_file_map: Option<HashMap<String, (String, String)>> = if self.config.integrity {
+            let lock_file_guard = self.lock_file.lock().await;
+            if let Some(ref lock_file) = *lock_file_guard {
+                Some(
+                    lock_file
+                        .entries()
+                        .iter()
+                        .map(|e| {
+                            (
+                                e.image_id().to_string(),
+                                (e.image_location().to_string(), e.image_sha256().to_string()),
+                            )
+                        })
+                        .collect(),
                 )
-            })
-            .collect();
-
-        for handle in handles {
-            if let Err(e) = handle.await.expect("Task panicked") {
-                eprintln!("  Error processing wallpaper: {}", e);
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        let mut needs_download = Vec::new();
+        let mut integrity_checks = Vec::new();
+        for wallpaper in &self.wallpapers {
+            if let Some(existing_path) = file_map.get(wallpaper) {
+                if self.config.integrity {
+                    if let Some(ref lock_map) = lock_file_map {
+                        if let Some((lock_location, expected_sha256)) = lock_map.get(wallpaper) {
+                            let path_str = existing_path.to_string_lossy().to_string();
+                            if lock_location == &path_str {
+                                integrity_checks.push((
+                                    wallpaper.clone(),
+                                    existing_path.clone(),
+                                    expected_sha256.clone(),
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                    needs_download.push(wallpaper.clone());
+                } else {
+                    println!("   Skipping {}: already exists", wallpaper);
+                }
+            } else {
+                needs_download.push(wallpaper.clone());
+            }
+        }
+
+        if !integrity_checks.is_empty() {
+            let check_tasks: FuturesUnordered<_> = integrity_checks
+                .into_iter()
+                .map(|(wallpaper_id, path, expected_hash)| {
+                    tokio::spawn(async move {
+                        match helper::calculate_sha256(&path).await {
+                            Ok(actual_sha256) => {
+                                if actual_sha256 == expected_hash {
+                                    println!(
+                                        "   Skipping {}: already exists and integrity check passed",
+                                        wallpaper_id
+                                    );
+                                    Ok::<(String, bool), anyhow::Error>((wallpaper_id, false))
+                                } else {
+                                    println!(
+                                        "   Integrity check failed for {}: re-downloading",
+                                        wallpaper_id
+                                    );
+                                    Ok::<(String, bool), anyhow::Error>((wallpaper_id, true))
+                                }
+                            }
+                            Err(_) => {
+                                println!("   Skipping {}: already exists", wallpaper_id);
+                                Ok::<(String, bool), anyhow::Error>((wallpaper_id, true))
+                            },
+                        }
+                    })
+                })
+                .collect();
+
+            let mut check_tasks = check_tasks;
+            while let Some(result) = check_tasks.next().await {
+                match result {
+                    Ok(Ok((wallpaper_id, should_download))) => {
+                        if should_download {
+                            needs_download.push(wallpaper_id);
+                        }
+                    }
+                    _ => {
+                        unreachable!()
+                    }
+                }
+            }
+        }
+
+        if needs_download.is_empty() {
+            println!("   All wallpapers are up to date.");
+            return Ok(());
+        }
+
+        let mut tasks = FuturesUnordered::new();
+        for wallpaper in needs_download {
+            let config = self.config.clone();
+            let lock_file = Arc::clone(&self.lock_file);
+            tasks.push(tokio::spawn(async move {
+                process_wallpaper_optimized(&config, &lock_file, &wallpaper).await
+            }));
+        }
+
+        let mut errors = 0;
+        let mut completed = 0;
+        let total = tasks.len();
+        while let Some(result) = tasks.next().await {
+            completed += 1;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    eprintln!("❌ Error processing wallpaper: {}", e);
+                    errors += 1;
+                }
+                Err(e) => {
+                    eprintln!("❌ Task panicked: {}", e);
+                    errors += 1;
+                }
+            }
+        }
+
+        if errors > 0 {
+            eprintln!(
+                "   Completed {} of {} with {} error(s)",
+                completed, total, errors
+            );
         }
 
         Ok(())
@@ -209,14 +368,6 @@ impl RustPaper {
             match status {
                 WallpaperStatus::Downloaded { path } => {
                     println!("  ✓ {} - Downloaded ({})", wallpaper_id, path.display());
-                    downloaded_count += 1;
-                }
-                WallpaperStatus::DownloadedWithIntegrity { path } => {
-                    println!(
-                        "  ✓ {} - Downloaded (verified) ({})",
-                        wallpaper_id,
-                        path.display()
-                    );
                     downloaded_count += 1;
                 }
                 WallpaperStatus::NotDownloaded => {
@@ -397,7 +548,6 @@ impl RustPaper {
 /// Status of a wallpaper
 enum WallpaperStatus {
     Downloaded { path: PathBuf },
-    DownloadedWithIntegrity { path: PathBuf },
     NotDownloaded,
 }
 
@@ -411,14 +561,6 @@ async fn check_download_status(
         // Check if integrity is enabled and verified
         let lock_file_guard = lock_file.lock().await;
         if let Some(ref lock_file) = *lock_file_guard {
-            if let Ok(existing_image_sha256) = helper::calculate_sha256(&existing_path).await {
-                if lock_file.contains(wallpaper_id, &existing_image_sha256) {
-                    return Ok(WallpaperStatus::DownloadedWithIntegrity {
-                        path: existing_path,
-                    });
-                }
-            }
-            // File exists but integrity check failed or not in lock file
             return Ok(WallpaperStatus::Downloaded {
                 path: existing_path,
             });
@@ -450,55 +592,6 @@ async fn update_wallpaper_list(list: &[String], file_given: impl AsRef<Path>) ->
     }
 
     writer.flush().await?;
-    Ok(())
-}
-
-async fn process_wallpaper(
-    config: &config::Config,
-    lock_file: &Arc<Mutex<Option<LockFile>>>,
-    wallpaper: &str,
-) -> Result<()> {
-    if let Some(existing_path) = find_existing_image(&config.save_location, wallpaper).await? {
-        if config.integrity {
-            if check_integrity(&existing_path, &wallpaper, &lock_file).await? {
-                println!(
-                    "   Skipping {}: already exists and integrity check passed",
-                    wallpaper
-                );
-                return Ok(());
-            }
-            println!(
-                "   Integrity check failed for {}: re-downloading",
-                wallpaper
-            );
-        } else {
-            println!("   Skipping {}: already exists", wallpaper);
-            return Ok(());
-        }
-    }
-
-    let wallhaven_img_link = format!("{}/{}", WALLHEAVEN_API, wallpaper.trim());
-    let curl_data = retry_get_curl_content(&wallhaven_img_link).await?;
-    let res: Value = serde_json::from_str(&curl_data)?;
-
-    if let Some(error) = res.get("error") {
-        eprintln!("Error : {}", error);
-        return Err(anyhow::anyhow!("   API error: {}", error));
-    }
-
-    let image_location = download_and_save(&res, wallpaper, &config.save_location).await?;
-
-    if config.integrity {
-        let mut lock_file_guard = lock_file.lock().await;
-        if let Some(ref mut lock_file) = *lock_file_guard {
-            let image_sha256 = helper::calculate_sha256(&image_location).await?;
-            lock_file
-                .add(wallpaper.to_string(), image_location, image_sha256)
-                .await?;
-        }
-    }
-
-    println!("   Downloaded {}", wallpaper);
     Ok(())
 }
 
@@ -536,22 +629,6 @@ async fn find_existing_image(
         }
     }
     Ok(None)
-}
-
-/// Check if an existing image matches the integrity hash
-async fn check_integrity(
-    existing_path_given: impl AsRef<Path>,
-    wallpaper: &str,
-    lock_file: &Arc<Mutex<Option<LockFile>>>,
-) -> Result<bool> {
-    let existing_path = existing_path_given.as_ref();
-    let lock_file_guard = lock_file.lock().await;
-    if let Some(ref lock_file) = *lock_file_guard {
-        let existing_image_sha256 = helper::calculate_sha256(existing_path).await?;
-        Ok(lock_file.contains(wallpaper, &existing_image_sha256))
-    } else {
-        Ok(false)
-    }
 }
 
 /// Download and save an image from API data

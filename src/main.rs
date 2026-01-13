@@ -30,7 +30,7 @@ enum Command {
     },
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 100)]
 async fn main() -> Result<(), Error> {
     let cli = Cli::parse();
     let mut rust_paper = RustPaper::new().await?;

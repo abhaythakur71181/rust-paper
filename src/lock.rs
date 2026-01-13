@@ -5,8 +5,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 
 use crate::helper;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct LockEntry {
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) struct LockEntry {
     image_id: String,
     image_location: String,
     sha256: String,
@@ -106,6 +106,11 @@ impl LockFile {
             .any(|entry| entry.image_id == image_id && entry.sha256 == hash)
     }
 
+    /// Get a reference to the entries (for fast lookups without mutex)
+    pub fn entries(&self) -> &[LockEntry] {
+        &self.entries
+    }
+
     /// Remove an entry from the lock file by image_id
     pub async fn remove(&mut self, image_id: &str) -> Result<()> {
         let initial_len = self.entries.len();
@@ -139,6 +144,20 @@ impl LockFile {
         }
 
         Ok(())
+    }
+}
+
+impl LockEntry {
+    pub fn image_id(&self) -> &str {
+        &self.image_id
+    }
+
+    pub fn image_location(&self) -> &str {
+        &self.image_location
+    }
+
+    pub fn image_sha256(&self) -> &str {
+        &self.sha256
     }
 }
 
