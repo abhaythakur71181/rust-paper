@@ -48,11 +48,17 @@ async fn build_file_map(save_location: &str) -> Result<HashMap<String, PathBuf>>
     Ok(file_map)
 }
 
+/// Result of processing a wallpaper (for batch lock file updates)
+struct ProcessResult {
+    wallpaper_id: String,
+    image_location: String,
+    sha256: Option<String>,
+}
+
 async fn process_wallpaper_optimized(
     config: &config::Config,
-    lock_file: &Arc<Mutex<Option<LockFile>>>,
     wallpaper: &str,
-) -> Result<()> {
+) -> Result<ProcessResult> {
     let wallhaven_img_link = format!("{}/{}", WALLHEAVEN_API, wallpaper.trim());
     let curl_data = retry_get_curl_content(&wallhaven_img_link).await?;
     let res: Value = serde_json::from_str(&curl_data)?;
@@ -61,17 +67,19 @@ async fn process_wallpaper_optimized(
         return Err(anyhow::anyhow!("❌ API error: {}", error));
     }
     let image_location = download_and_save(&res, wallpaper, &config.save_location).await?;
-    if config.integrity {
-        let mut lock_file_guard = lock_file.lock().await;
-        if let Some(ref mut lock_file) = *lock_file_guard {
-            let image_sha256 = helper::calculate_sha256(&image_location).await?;
-            lock_file
-                .add(wallpaper.to_string(), image_location, image_sha256)
-                .await?;
-        }
-    }
-    println!("   Downloaded {}", wallpaper);
-    Ok(())
+
+    let sha256 = if config.integrity {
+        Some(helper::calculate_sha256(&image_location).await?)
+    } else {
+        None
+    };
+
+    println!("✔️ Downloaded {}", wallpaper);
+    Ok(ProcessResult {
+        wallpaper_id: wallpaper.to_string(),
+        image_location,
+        sha256,
+    })
 }
 
 impl RustPaper {
@@ -165,10 +173,6 @@ impl RustPaper {
                         match helper::calculate_sha256(&path).await {
                             Ok(actual_sha256) => {
                                 if actual_sha256 == expected_hash {
-                                    println!(
-                                        "   Skipping {}: already exists and integrity check passed",
-                                        wallpaper_id
-                                    );
                                     Ok::<(String, bool), anyhow::Error>((wallpaper_id, false))
                                 } else {
                                     println!(
@@ -178,10 +182,7 @@ impl RustPaper {
                                     Ok::<(String, bool), anyhow::Error>((wallpaper_id, true))
                                 }
                             }
-                            Err(_) => {
-                                println!("   Skipping {}: already exists", wallpaper_id);
-                                Ok::<(String, bool), anyhow::Error>((wallpaper_id, true))
-                            },
+                            Err(_) => Ok::<(String, bool), anyhow::Error>((wallpaper_id, true)),
                         }
                     })
                 })
@@ -210,19 +211,30 @@ impl RustPaper {
         let mut tasks = FuturesUnordered::new();
         for wallpaper in needs_download {
             let config = self.config.clone();
-            let lock_file = Arc::clone(&self.lock_file);
             tasks.push(tokio::spawn(async move {
-                process_wallpaper_optimized(&config, &lock_file, &wallpaper).await
+                process_wallpaper_optimized(&config, &wallpaper).await
             }));
         }
 
         let mut errors = 0;
         let mut completed = 0;
         let total = tasks.len();
+        let mut lock_file_updates = Vec::new();
+
         while let Some(result) = tasks.next().await {
             completed += 1;
             match result {
-                Ok(Ok(())) => {}
+                Ok(Ok(process_result)) => {
+                    if self.config.integrity {
+                        if let Some(sha256) = process_result.sha256 {
+                            lock_file_updates.push((
+                                process_result.wallpaper_id,
+                                process_result.image_location,
+                                sha256,
+                            ));
+                        }
+                    }
+                }
                 Ok(Err(e)) => {
                     eprintln!("❌ Error processing wallpaper: {}", e);
                     errors += 1;
@@ -233,10 +245,18 @@ impl RustPaper {
                 }
             }
         }
-
+        if self.config.integrity && !lock_file_updates.is_empty() {
+            let mut lock_file_guard = self.lock_file.lock().await;
+            if let Some(ref mut lock_file) = *lock_file_guard {
+                for (image_id, image_location, sha256) in lock_file_updates {
+                    lock_file.add_entry(image_id, image_location, sha256);
+                }
+                lock_file.save().await?;
+            }
+        }
         if errors > 0 {
             eprintln!(
-                "   Completed {} of {} with {} error(s)",
+                "✔️ Completed {} of {} with {} error(s)",
                 completed, total, errors
             );
         }
@@ -270,7 +290,7 @@ impl RustPaper {
                 valid_wallpapers.push(wallpaper);
             } else {
                 eprintln!(
-                    "  Warning: Invalid wallpaper ID format '{}', skipping",
+                    "‼️ Warning: Invalid wallpaper ID format '{}', skipping",
                     wallpaper
                 );
             }
@@ -317,7 +337,7 @@ impl RustPaper {
         let removed_count = original_len - self.wallpapers.len();
 
         if removed_count == 0 {
-            println!("  No matching wallpaper IDs found in the list");
+            println!("   No matching wallpaper IDs found in the list");
             return Ok(());
         }
 
@@ -335,10 +355,13 @@ impl RustPaper {
         }
 
         if removed_count == ids.len() {
-            println!("  Removed {} wallpaper ID(s) from the list", removed_count);
+            println!(
+                "   Removed {} wallpaper ID(s) from the list",
+                removed_count
+            );
         } else {
             println!(
-                "  Removed {} of {} requested wallpaper ID(s) from the list",
+                "   Removed {} of {} requested wallpaper ID(s) from the list",
                 removed_count,
                 ids.len()
             );
@@ -350,7 +373,7 @@ impl RustPaper {
     /// List all tracked wallpapers with their download status
     pub async fn list(&self) -> Result<()> {
         if self.wallpapers.is_empty() {
-            println!("  No wallpapers tracked.");
+            println!("   No wallpapers tracked.");
             return Ok(());
         }
 
@@ -425,18 +448,18 @@ impl RustPaper {
                 }
                 match tokio::fs::remove_file(&file_path).await {
                     Ok(_) => {
-                        println!("  Removed: {} ({})", file_stem, file_path.display());
+                        println!("   Removed: {} ({})", file_stem, file_path.display());
                         removed_count += 1;
                     }
                     Err(e) => {
-                        eprintln!("  Error removing {}: {}", file_path.display(), e);
+                        eprintln!("   Error removing {}: {}", file_path.display(), e);
                     }
                 }
             }
         }
 
         if removed_count == 0 {
-            println!("  No orphaned files found. Everything is clean!");
+            println!("   No orphaned files found. Everything is clean!");
         } else {
             println!();
             println!(
@@ -560,7 +583,7 @@ async fn check_download_status(
     if let Some(existing_path) = find_existing_image(save_location, wallpaper_id).await? {
         // Check if integrity is enabled and verified
         let lock_file_guard = lock_file.lock().await;
-        if let Some(ref lock_file) = *lock_file_guard {
+        if let Some(_) = *lock_file_guard {
             return Ok(WallpaperStatus::Downloaded {
                 path: existing_path,
             });
@@ -649,7 +672,7 @@ async fn retry_get_curl_content(url: &str) -> Result<String> {
             Err(e) if retry_count + 1 < MAX_RETRY => {
                 let delay = 2_u64.pow(retry_count); // Exponential backoff
                 eprintln!(
-                    "Error fetching content (attempt {} of {}): {}. Retrying in {}s...",
+                    "   Error fetching content (attempt {} of {}): {}. Retrying in {}s...",
                     retry_count + 1,
                     MAX_RETRY,
                     e,

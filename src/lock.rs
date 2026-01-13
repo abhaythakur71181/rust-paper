@@ -29,7 +29,7 @@ impl LockFile {
     /// Load lock file from disk asynchronously
     pub async fn load() -> Result<Self> {
         let lock_file_location = helper::get_folder_path()
-            .context("  Failed to get folder path")?
+            .context("   Failed to get folder path")?
             .join("wallpaper.lock");
 
         if tokio::fs::metadata(&lock_file_location).await.is_ok() {
@@ -38,10 +38,10 @@ impl LockFile {
             let mut contents = String::new();
             reader.read_to_string(&mut contents).await?;
             let lock_file: LockFile =
-                serde_json::from_str(&contents).context("  Failed to parse lock file")?;
+                serde_json::from_str(&contents).context("   Failed to parse lock file")?;
             Ok(lock_file)
         } else {
-            Err(anyhow!("  Lock file does not exist"))
+            Err(anyhow!("   Lock file does not exist"))
         }
     }
 
@@ -50,17 +50,8 @@ impl LockFile {
         Self::load().await.unwrap_or_else(|_| Self::new())
     }
 
-    /// Add or update an entry in the lock file
-    pub async fn add(
-        &mut self,
-        image_id: String,
-        image_location: String,
-        sha256: String,
-    ) -> Result<()> {
-        let lock_file_location = helper::get_folder_path()
-            .context("  Failed to get folder path")?
-            .join("wallpaper.lock");
-
+    /// Add or update an entry in memory (does not write to disk)
+    pub fn add_entry(&mut self, image_id: String, image_location: String, sha256: String) {
         if let Some(entry) = self
             .entries
             .iter_mut()
@@ -75,6 +66,13 @@ impl LockFile {
                 sha256,
             });
         }
+    }
+
+    /// Save the lock file to disk
+    pub async fn save(&self) -> Result<()> {
+        let lock_file_location = helper::get_folder_path()
+            .context("  Failed to get folder path")?
+            .join("wallpaper.lock");
 
         let file = OpenOptions::new()
             .create(true)
@@ -82,21 +80,32 @@ impl LockFile {
             .truncate(true)
             .open(&lock_file_location)
             .await
-            .context("  Failed to open lock file for writing")?;
+            .context("   Failed to open lock file for writing")?;
 
         let mut writer = BufWriter::new(file);
         let json =
-            serde_json::to_string_pretty(&self).context("  Failed to serialize lock file")?;
+            serde_json::to_string_pretty(&self).context("   Failed to serialize lock file")?;
         writer
             .write_all(json.as_bytes())
             .await
-            .context("  Failed to write lock file")?;
+            .context("   Failed to write lock file")?;
         writer
             .flush()
             .await
-            .context("  Failed to flush lock file")?;
+            .context("   Failed to flush lock file")?;
 
         Ok(())
+    }
+
+    /// Add or update an entry in the lock file (writes to disk immediately)
+    pub async fn add(
+        &mut self,
+        image_id: String,
+        image_location: String,
+        sha256: String,
+    ) -> Result<()> {
+        self.add_entry(image_id, image_location, sha256);
+        self.save().await
     }
 
     /// Check if the lock file contains an entry with the given image_id and hash
@@ -119,7 +128,7 @@ impl LockFile {
         // Only update file if an entry was actually removed
         if self.entries.len() < initial_len {
             let lock_file_location = helper::get_folder_path()
-                .context("  Failed to get folder path")?
+                .context("   Failed to get folder path")?
                 .join("wallpaper.lock");
 
             let file = OpenOptions::new()
@@ -128,19 +137,19 @@ impl LockFile {
                 .truncate(true)
                 .open(&lock_file_location)
                 .await
-                .context("  Failed to open lock file for writing")?;
+                .context("   Failed to open lock file for writing")?;
 
             let mut writer = BufWriter::new(file);
             let json =
-                serde_json::to_string_pretty(&self).context("  Failed to serialize lock file")?;
+                serde_json::to_string_pretty(&self).context("   Failed to serialize lock file")?;
             writer
                 .write_all(json.as_bytes())
                 .await
-                .context("  Failed to write lock file")?;
+                .context("   Failed to write lock file")?;
             writer
                 .flush()
                 .await
-                .context("  Failed to flush lock file")?;
+                .context("   Failed to flush lock file")?;
         }
 
         Ok(())
