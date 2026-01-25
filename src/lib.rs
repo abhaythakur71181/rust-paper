@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
+use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -7,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::{create_dir_all, File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::sleep;
 
 mod config;
@@ -17,7 +18,6 @@ mod lock;
 use lock::LockFile;
 
 const WALLHEAVEN_API: &str = "https://wallhaven.cc/api/v1/w";
-const MAX_RETRY: u32 = 3;
 
 /// Main RustPaper struct for managing wallpapers
 #[derive(Clone)]
@@ -27,6 +27,8 @@ pub struct RustPaper {
     wallpapers: Vec<String>,
     wallpapers_list_file_location: PathBuf,
     lock_file: Arc<Mutex<Option<LockFile>>>,
+    http_client: Client,
+    download_semaphore: Arc<Semaphore>,
 }
 
 /// INFO: Build a map of wallpaper IDs to file paths (cached directory listing)
@@ -58,15 +60,22 @@ struct ProcessResult {
 async fn process_wallpaper_optimized(
     config: &config::Config,
     wallpaper: &str,
+    client: &Client,
 ) -> Result<ProcessResult> {
     let wallhaven_img_link = format!("{}/{}", WALLHEAVEN_API, wallpaper.trim());
-    let curl_data = retry_get_curl_content(&wallhaven_img_link).await?;
+    let curl_data = retry_get_curl_content(
+        &wallhaven_img_link,
+        client,
+        config.api_key.as_deref(),
+        config.retry_count,
+    )
+    .await?;
     let res: Value = serde_json::from_str(&curl_data)?;
     if let Some(error) = res.get("error") {
         eprintln!("Error : {}", error);
         return Err(anyhow::anyhow!("❌ API error: {}", error));
     }
-    let image_location = download_and_save(&res, wallpaper, &config.save_location).await?;
+    let image_location = download_and_save(&res, wallpaper, &config.save_location, client).await?;
 
     let sha256 = if config.integrity {
         Some(helper::calculate_sha256(&image_location).await?)
@@ -103,6 +112,8 @@ impl RustPaper {
         } else {
             None
         };
+        let http_client = helper::create_http_client(config.timeout)?;
+        let download_semaphore = Arc::new(Semaphore::new(config.max_concurrent_downloads));
 
         Ok(Self {
             config,
@@ -110,6 +121,8 @@ impl RustPaper {
             wallpapers,
             wallpapers_list_file_location,
             lock_file: Arc::new(Mutex::new(lock_file)),
+            http_client,
+            download_semaphore,
         })
     }
 
@@ -211,8 +224,12 @@ impl RustPaper {
         let mut tasks = FuturesUnordered::new();
         for wallpaper in needs_download {
             let config = self.config.clone();
+            let client = self.http_client.clone();
+            let semaphore = self.download_semaphore.clone();
             tasks.push(tokio::spawn(async move {
-                process_wallpaper_optimized(&config, &wallpaper).await
+                // Acquire semaphore permit to limit concurrent downloads
+                let _permit = semaphore.acquire().await.expect("Semaphore closed");
+                process_wallpaper_optimized(&config, &wallpaper, &client).await
             }));
         }
 
@@ -493,7 +510,13 @@ impl RustPaper {
         }
 
         let api_url = format!("{}/{}", WALLHEAVEN_API, wallpaper_id);
-        let response_data = retry_get_curl_content(&api_url).await?;
+        let response_data = retry_get_curl_content(
+            &api_url,
+            &self.http_client,
+            self.config.api_key.as_deref(),
+            self.config.retry_count,
+        )
+        .await?;
         let json: Value = serde_json::from_str(&response_data)?;
         if let Some(error) = json.get("error") {
             return Err(anyhow::anyhow!("API error: {}", error));
@@ -655,26 +678,36 @@ async fn find_existing_image(
 }
 
 /// Download and save an image from API data
-async fn download_and_save(api_data: &Value, id: &str, save_location: &str) -> Result<String> {
+async fn download_and_save(
+    api_data: &Value,
+    id: &str,
+    save_location: &str,
+    client: &Client,
+) -> Result<String> {
     let img_link = api_data
         .get("data")
         .and_then(|data| data.get("path"))
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("   Failed to get image link from API response"))?;
-    helper::download_image(&img_link, id, save_location).await
+    helper::download_image(&img_link, id, save_location, client).await
 }
 
 /// Retry fetching content from a URL with exponential backoff
-async fn retry_get_curl_content(url: &str) -> Result<String> {
-    for retry_count in 0..MAX_RETRY {
-        match helper::get_curl_content(url).await {
+async fn retry_get_curl_content(
+    url: &str,
+    client: &Client,
+    api_key: Option<&str>,
+    max_retry: u32,
+) -> Result<String> {
+    for retry_count in 0..max_retry {
+        match helper::get_curl_content(url, client, api_key).await {
             Ok(content) => return Ok(content),
-            Err(e) if retry_count + 1 < MAX_RETRY => {
+            Err(e) if retry_count + 1 < max_retry => {
                 let delay = 2_u64.pow(retry_count); // Exponential backoff
                 eprintln!(
                     "   Error fetching content (attempt {} of {}): {}. Retrying in {}s...",
                     retry_count + 1,
-                    MAX_RETRY,
+                    max_retry,
                     e,
                     delay
                 );

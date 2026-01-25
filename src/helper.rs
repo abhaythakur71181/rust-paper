@@ -30,25 +30,26 @@ pub fn get_img_extension(format: &ImageFormat) -> &'static str {
     extensions.get(format).unwrap_or(&"jpg")
 }
 
-static HTTP_CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
-
-/// Get the global HTTP client instance (reused for all requests)
-fn get_http_client() -> &'static Client {
-    HTTP_CLIENT.get_or_init(|| {
-        Client::builder()
-            .user_agent("rust-paper/0.1.2")
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("Failed to create HTTP client")
-    })
+/// Create an HTTP client with the given timeout
+pub fn create_http_client(timeout_secs: u64) -> Result<Client> {
+    Client::builder()
+        .user_agent("rust-paper/0.1.2")
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+        .context("Failed to create HTTP client")
 }
 
 /// Fetch content from a URL with proper error handling
-pub async fn get_curl_content(link: &str) -> Result<String> {
-    let client = get_http_client();
-
-    let response = client
-        .get(link)
+pub async fn get_curl_content(
+    link: &str,
+    client: &Client,
+    api_key: Option<&str>,
+) -> Result<String> {
+    let mut request = client.get(link);
+    if let Some(key) = api_key {
+        request = request.query(&[("apikey", key)]);
+    }
+    let response = request
         .send()
         .await
         .context("Failed to send HTTP request")?;
@@ -102,9 +103,13 @@ pub async fn calculate_sha256(file_path: impl AsRef<Path>) -> Result<String> {
 }
 
 /// Download an image from a URL and save it to disk
-pub async fn download_image(url: &str, id: &str, save_location: &str) -> Result<String> {
+pub async fn download_image(
+    url: &str,
+    id: &str,
+    save_location: &str,
+    client: &Client,
+) -> Result<String> {
     let url = reqwest::Url::parse(url).context("Invalid image URL")?;
-    let client = get_http_client();
     let response = client
         .get(url)
         .send()
