@@ -21,8 +21,10 @@ confy = "0.6.1"
 dirs = "5.0.1"
 futures = "0.3.31"
 image = "0.25.1"
-reqwest = { version = "0.12.4", features = ["json"] }
+indicatif = "0.18.3"
+reqwest = { version = "0.12.4", features = ["json", "stream"] }
 serde = { version = "1.0.203", features = ["derive"] }
+serde-aux = "4.5.0"
 serde_json = "1.0.117"
 sha2 = "0.10.8"
 tokio = { version = "1.40.0", features = ["full"] }
