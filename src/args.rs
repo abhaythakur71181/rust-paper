@@ -4,7 +4,7 @@ use crate::api::Url;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
 #[derive(Parser)]
-pub(crate) struct Cli {
+pub struct Cli {
     #[clap(subcommand)]
     pub command: Command,
 }
@@ -46,9 +46,9 @@ pub enum Command {
                 .args(&["query", "colors"]),
         ))]
 pub struct SearchArgs {
-    /// Path to save wallpapers
-    #[clap(short = 'S', long, verbatim_doc_comment, help_heading = "DOWNLOAD")]
-    pub path: Option<String>,
+    /// Download wallpapers to save_location from config (uses Wallhaven ID as filename)
+    #[clap(short = 'd', long, verbatim_doc_comment, help_heading = "DOWNLOAD")]
+    pub download: bool,
 
     /// Query string
     ///

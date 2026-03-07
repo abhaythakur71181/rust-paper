@@ -6,29 +6,36 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::fs::{create_dir_all, File, OpenOptions};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::fs::{create_dir_all, File};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::sleep;
 
 mod config;
 mod helper;
 mod lock;
+mod args;
+mod api;
 
 use lock::LockFile;
 
-const WALLHEAVEN_API: &str = "https://wallhaven.cc/api/v1/w";
+use crate::helper::{get_key_from_config_or_env, update_wallpaper_list};
+
+pub use args::{Cli, Command};
+pub use api::{WallhavenClient, WallhavenClientError};
+
+pub const WALLHAVEN_API: &str = "https://wallhaven.cc/api/v1/w";
+pub const WALLHAVEN_BASE: &str = "https://wallhaven.cc/w";
 
 /// Main RustPaper struct for managing wallpapers
-#[derive(Clone)]
 pub struct RustPaper {
-    config: config::Config,
-    config_folder: PathBuf,
-    wallpapers: Vec<String>,
-    wallpapers_list_file_location: PathBuf,
-    lock_file: Arc<Mutex<Option<LockFile>>>,
-    http_client: Client,
-    download_semaphore: Arc<Semaphore>,
+    pub config: config::Config,
+    pub config_folder: PathBuf,
+    pub wallpapers: Vec<String>,
+    pub wallpapers_list_file_location: PathBuf,
+    pub lock_file: Arc<Mutex<Option<LockFile>>>,
+    pub http_client: Client,
+    pub download_semaphore: Arc<Semaphore>,
 }
 
 /// INFO: Build a map of wallpaper IDs to file paths (cached directory listing)
@@ -62,40 +69,57 @@ async fn process_wallpaper_optimized(
     wallpaper: &str,
     client: &Client,
 ) -> Result<ProcessResult> {
-    let wallhaven_img_link = format!("{}/{}", WALLHEAVEN_API, wallpaper.trim());
-    let curl_data = retry_get_curl_content(
-        &wallhaven_img_link,
-        client,
-        config.api_key.as_deref(),
-        config.retry_count,
-    )
-    .await?;
-    let res: Value = serde_json::from_str(&curl_data)?;
-    if let Some(error) = res.get("error") {
-        eprintln!("Error : {}", error);
-        return Err(anyhow::anyhow!("❌ API error: {}", error));
-    }
-    
-    // Download with or without hash depending on whether we have API key
-    let (image_location, sha256) = if config.api_key.is_some() && config.integrity {
-        // Use API URL download with built-in hashing
-        download_and_save_with_hash(&res, wallpaper, &config.save_location, client).await?
+    let img_link: String = if let Some(api_key) = config.api_key.as_deref() {
+        let wallhaven_img_link = format!("{}/{}", WALLHAVEN_API, wallpaper.trim());
+        let curl_data = retry_get_curl_content(
+            &wallhaven_img_link,
+            client,
+            Some(api_key),
+            config.retry_count,
+        )
+        .await?;
+        let res: Value = serde_json::from_str(&curl_data)?;
+        if let Some(error) = res.get("error") {
+            eprintln!("Error : {}", error);
+            return Err(anyhow::anyhow!("❌ API error: {}", error));
+        }
+        res.get("data")
+            .and_then(|data| data.get("path"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Failed to get image link from API response"))?
+            .to_string()
     } else {
-        let location = download_and_save(&res, wallpaper, &config.save_location, client).await?;
-        let hash = if config.integrity {
-            Some(helper::calculate_sha256(&location).await?)
-        } else {
-            None
-        };
-        (location, hash)
+        let wallhaven_img_link = format!("{}/{}", WALLHAVEN_BASE, wallpaper.trim());
+        let curl_data =
+            retry_get_curl_content(&wallhaven_img_link, client, None, config.retry_count).await?;
+        helper::scrape_img_link(curl_data)?
     };
-
-    println!("✔️ Downloaded {}", wallpaper);
-    Ok(ProcessResult {
-        wallpaper_id: wallpaper.to_string(),
-        image_location,
-        sha256,
-    })
+    match helper::download_with_progress(
+        &img_link,
+        wallpaper,
+        &config.save_location,
+        client,
+        config.integrity,
+    )
+    .await
+    {
+        Ok(result) => {
+            println!("  ✓ Downloaded {} - {}", &wallpaper, &result.file_path);
+            if let Some(hash) = &result.sha256 {
+                println!("    SHA256: {}", &hash);
+            }
+            println!("✔️ Downloaded {}", wallpaper);
+            Ok(ProcessResult {
+                wallpaper_id: wallpaper.to_string(),
+                image_location: result.file_path,
+                sha256: result.sha256,
+            })
+        }
+        Err(e) => {
+            eprintln!("  ✗ Failed to download {}: {}", &wallpaper, e);
+            Err(anyhow::anyhow!("Failed to download {}: {}", &wallpaper, e))
+        }
+    }
 }
 
 impl RustPaper {
@@ -124,7 +148,8 @@ impl RustPaper {
         } else {
             None
         };
-        let http_client = helper::create_http_client(config.timeout)?;
+        let api_key = get_key_from_config_or_env(config.api_key.as_deref());
+        let http_client = helper::create_http_client(config.timeout, api_key.as_ref())?;
         let download_semaphore = Arc::new(Semaphore::new(config.max_concurrent_downloads));
 
         Ok(Self {
@@ -232,48 +257,69 @@ impl RustPaper {
             println!("   All wallpapers are up to date.");
             return Ok(());
         }
-
-        let mut tasks = FuturesUnordered::new();
+        let mut lock_file_updates = Vec::new();
+        let mut errors = 0;
+        let mut completed = 0;
+        let total = needs_download.len();
         for wallpaper in needs_download {
             let config = self.config.clone();
             let client = self.http_client.clone();
-            let semaphore = self.download_semaphore.clone();
-            tasks.push(tokio::spawn(async move {
-                // Acquire semaphore permit to limit concurrent downloads
-                let _permit = semaphore.acquire().await.expect("Semaphore closed");
-                process_wallpaper_optimized(&config, &wallpaper, &client).await
-            }));
-        }
-
-        let mut errors = 0;
-        let mut completed = 0;
-        let total = tasks.len();
-        let mut lock_file_updates = Vec::new();
-
-        while let Some(result) = tasks.next().await {
-            completed += 1;
-            match result {
-                Ok(Ok(process_result)) => {
-                    if self.config.integrity {
-                        if let Some(sha256) = process_result.sha256 {
-                            lock_file_updates.push((
-                                process_result.wallpaper_id,
-                                process_result.image_location,
-                                sha256,
-                            ));
-                        }
+            match process_wallpaper_optimized(&config, &wallpaper, &client).await {
+                Ok(result) => {
+                    completed += 1;
+                    if let Some(sha256) = result.sha256 {
+                        lock_file_updates.push((
+                            result.wallpaper_id,
+                            result.image_location,
+                            sha256,
+                        ));
                     }
                 }
-                Ok(Err(e)) => {
-                    eprintln!("❌ Error processing wallpaper: {}", e);
-                    errors += 1;
-                }
-                Err(e) => {
-                    eprintln!("❌ Task panicked: {}", e);
-                    errors += 1;
-                }
+                Err(_) => errors += 1,
             }
         }
+
+        // let mut tasks = FuturesUnordered::new();
+        // for wallpaper in needs_download {
+        //     let config = self.config.clone();
+        //     let client = self.http_client.clone();
+        //     let semaphore = self.download_semaphore.clone();
+        //     tasks.push(tokio::spawn(async move {
+        //         // Acquire semaphore permit to limit concurrent downloads
+        //         let _permit = semaphore.acquire().await.expect("Semaphore closed");
+        //         process_wallpaper_optimized(&config, &wallpaper, &client).await
+        //     }));
+        // }
+        //
+        // let mut errors = 0;
+        // let mut completed = 0;
+        // let total = tasks.len();
+        // let mut lock_file_updates = Vec::new();
+        //
+        // while let Some(result) = tasks.next().await {
+        //     completed += 1;
+        //     match result {
+        //         Ok(Ok(process_result)) => {
+        //             if self.config.integrity {
+        //                 if let Some(sha256) = process_result.sha256 {
+        //                     lock_file_updates.push((
+        //                         process_result.wallpaper_id,
+        //                         process_result.image_location,
+        //                         sha256,
+        //                     ));
+        //                 }
+        //             }
+        //         }
+        //         Ok(Err(e)) => {
+        //             eprintln!("❌ Error processing wallpaper: {}", e);
+        //             errors += 1;
+        //         }
+        //         Err(e) => {
+        //             eprintln!("❌ Task panicked: {}", e);
+        //             errors += 1;
+        //         }
+        //     }
+        // }
         if self.config.integrity && !lock_file_updates.is_empty() {
             let mut lock_file_guard = self.lock_file.lock().await;
             if let Some(ref mut lock_file) = *lock_file_guard {
@@ -521,7 +567,7 @@ impl RustPaper {
             ));
         }
 
-        let api_url = format!("{}/{}", WALLHEAVEN_API, wallpaper_id);
+        let api_url = format!("{}/{}", WALLHAVEN_API, wallpaper_id);
         let response_data = retry_get_curl_content(
             &api_url,
             &self.http_client,
@@ -632,27 +678,6 @@ async fn check_download_status(
     }
 }
 
-/// Update the wallpaper list file with the given list of wallpapers
-async fn update_wallpaper_list(list: &[String], file_given: impl AsRef<Path>) -> Result<()> {
-    let file_path = file_given.as_ref();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(file_path)
-        .await?;
-
-    let mut writer = BufWriter::new(file);
-
-    for wallpaper in list {
-        writer.write_all(wallpaper.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-    }
-
-    writer.flush().await?;
-    Ok(())
-}
-
 /// Load wallpaper IDs from a file
 async fn load_wallpapers(given_file: impl AsRef<Path>) -> Result<Vec<String>> {
     let file_path = given_file.as_ref();
@@ -687,37 +712,6 @@ async fn find_existing_image(
         }
     }
     Ok(None)
-}
-
-/// Download and save an image from API data
-async fn download_and_save(
-    api_data: &Value,
-    id: &str,
-    save_location: &str,
-    client: &Client,
-) -> Result<String> {
-    let img_link = api_data
-        .get("data")
-        .and_then(|data| data.get("path"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("   Failed to get image link from API response"))?;
-    helper::download_image(&img_link, id, save_location, client).await
-}
-
-/// Download and save an image from API data with SHA256 hashing
-async fn download_and_save_with_hash(
-    api_data: &Value,
-    id: &str,
-    save_location: &str,
-    client: &Client,
-) -> Result<(String, Option<String>)> {
-    let img_link = api_data
-        .get("data")
-        .and_then(|data| data.get("path"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("   Failed to get image link from API response"))?;
-    let (location, hash) = helper::download_image_with_hash(&img_link, id, save_location, client).await?;
-    Ok((location, Some(hash)))
 }
 
 /// Retry fetching content from a URL with exponential backoff

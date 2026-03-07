@@ -1,14 +1,6 @@
-mod api;
-mod args;
-mod helper;
-mod lock;
-
 use anyhow::Error;
 use clap::Parser;
-use rust_paper::RustPaper;
-
-use crate::api::{get_key_from_config_or_env, WallhavenClient};
-use crate::args::{Cli, Command};
+use rust_paper::{Cli, Command, RustPaper, WallhavenClient};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 100)]
 async fn main() -> Result<(), Error> {
@@ -50,15 +42,8 @@ async fn main() -> Result<(), Error> {
         | Command::TagInfo(_)
         | Command::UserSettings(_)
         | Command::UserCollections(_) => {
-            let rust_paper = RustPaper::new().await?;
-            let api_key = get_key_from_config_or_env(rust_paper.config().api_key.as_deref());
-            if api_key.is_none() {
-                eprintln!("❌ Error: API key is required for this command.");
-                eprintln!("   Please set WALLHAVEN_API_KEY environment variable or add api_key to config.");
-                eprintln!("   Example: export WALLHAVEN_API_KEY=\"your_api_key_here\"");
-                std::process::exit(1);
-            }
-            let client = WallhavenClient::new(cli.command, api_key)
+            let mut client = WallhavenClient::new(cli.command)
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to create API client: {}", e))?;
             let result = client
                 .execute()
