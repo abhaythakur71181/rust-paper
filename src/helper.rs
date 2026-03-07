@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Error, Result};
-use image::{self, guess_format, load_from_memory, ImageFormat};
+use image::{self, guess_format, ImageFormat};
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::{
@@ -129,7 +129,7 @@ pub async fn download_image(
         .await
         .context("Failed to read image bytes")?;
 
-    let img = load_from_memory(&img_bytes).context("Failed to decode image")?;
+    // Detect format to get the correct extension
     let img_format = guess_format(&img_bytes).context("Failed to detect image format")?;
 
     let image_name = format!(
@@ -139,10 +139,64 @@ pub async fn download_image(
         get_img_extension(&img_format)
     );
 
-    img.save_with_format(&image_name, img_format)
+    // Save raw bytes directly to preserve integrity
+    tokio::fs::write(&image_name, &img_bytes)
+        .await
         .context("Failed to save image")?;
 
     Ok(image_name)
+}
+
+/// Download an image with SHA256 hashing support (for API downloads)
+pub async fn download_image_with_hash(
+    url: &str,
+    id: &str,
+    save_location: &str,
+    client: &Client,
+) -> Result<(String, String)> {
+    use sha2::{Digest, Sha256};
+
+    let url = reqwest::Url::parse(url).context("Invalid image URL")?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .context("Failed to download image")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "Failed to download image: HTTP {}",
+            status.as_u16()
+        ));
+    }
+
+    let img_bytes = response
+        .bytes()
+        .await
+        .context("Failed to read image bytes")?;
+
+    // Calculate SHA256 hash on raw bytes
+    let mut hasher = Sha256::new();
+    hasher.update(&img_bytes);
+    let hash = format!("{:x}", hasher.finalize());
+
+    // Detect format to get the correct extension
+    let img_format = guess_format(&img_bytes).context("Failed to detect image format")?;
+
+    let image_name = format!(
+        "{}/{}.{}",
+        save_location,
+        id,
+        get_img_extension(&img_format)
+    );
+
+    // Save raw bytes directly to preserve integrity
+    tokio::fs::write(&image_name, &img_bytes)
+        .await
+        .context("Failed to save image")?;
+
+    Ok((image_name, hash))
 }
 
 /// Get the home directory path as a string

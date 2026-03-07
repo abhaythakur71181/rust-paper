@@ -75,12 +75,19 @@ async fn process_wallpaper_optimized(
         eprintln!("Error : {}", error);
         return Err(anyhow::anyhow!("❌ API error: {}", error));
     }
-    let image_location = download_and_save(&res, wallpaper, &config.save_location, client).await?;
-
-    let sha256 = if config.integrity {
-        Some(helper::calculate_sha256(&image_location).await?)
+    
+    // Download with or without hash depending on whether we have API key
+    let (image_location, sha256) = if config.api_key.is_some() && config.integrity {
+        // Use API URL download with built-in hashing
+        download_and_save_with_hash(&res, wallpaper, &config.save_location, client).await?
     } else {
-        None
+        let location = download_and_save(&res, wallpaper, &config.save_location, client).await?;
+        let hash = if config.integrity {
+            Some(helper::calculate_sha256(&location).await?)
+        } else {
+            None
+        };
+        (location, hash)
     };
 
     println!("✔️ Downloaded {}", wallpaper);
@@ -92,6 +99,11 @@ async fn process_wallpaper_optimized(
 }
 
 impl RustPaper {
+    /// Get a reference to the configuration
+    pub fn config(&self) -> &config::Config {
+        &self.config
+    }
+
     /// Create a new RustPaper instance with loaded configuration
     pub async fn new() -> Result<Self> {
         let config: config::Config =
@@ -690,6 +702,22 @@ async fn download_and_save(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("   Failed to get image link from API response"))?;
     helper::download_image(&img_link, id, save_location, client).await
+}
+
+/// Download and save an image from API data with SHA256 hashing
+async fn download_and_save_with_hash(
+    api_data: &Value,
+    id: &str,
+    save_location: &str,
+    client: &Client,
+) -> Result<(String, Option<String>)> {
+    let img_link = api_data
+        .get("data")
+        .and_then(|data| data.get("path"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("   Failed to get image link from API response"))?;
+    let (location, hash) = helper::download_image_with_hash(&img_link, id, save_location, client).await?;
+    Ok((location, Some(hash)))
 }
 
 /// Retry fetching content from a URL with exponential backoff
