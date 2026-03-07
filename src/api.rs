@@ -175,8 +175,10 @@ pub(crate) trait Url {
 use futures::stream::StreamExt;
 use futures::TryFutureExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use std::time::Duration;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
+use tokio::time::sleep;
 
 use crate::args::Command;
 use crate::helper::get_key_from_config_or_env;
@@ -371,17 +373,45 @@ impl WallhavenClient {
     }
 
     pub async fn request(&self, url: String) -> Result<String, WallhavenClientError> {
-        let response = self
-            .http_client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| WallhavenClientError::RequestError(e.to_string()))?;
-
-        match response.text().await {
-            Ok(r) => Ok(r),
-            Err(e) => Err(WallhavenClientError::DecodeError(e.to_string())),
+        let max_retry = self.rust_paper.config.retry_count;
+        for retry_count in 0..max_retry {
+            let send_result = self.http_client.get(&url).send().await;
+            match send_result {
+                Ok(response) => match response.text().await {
+                    Ok(body) => return Ok(body),
+                    Err(e) if retry_count + 1 < max_retry => {
+                        let delay = 2_u64.pow(retry_count);
+                        eprintln!(
+                            "   Error reading response body (attempt {} of {}): {}. Retrying in {}s...",
+                            retry_count + 1,
+                            max_retry,
+                            e,
+                            delay
+                        );
+                        sleep(Duration::from_secs(delay)).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(WallhavenClientError::DecodeError(e.to_string()));
+                    }
+                },
+                Err(e) if retry_count + 1 < max_retry => {
+                    let delay = 2_u64.pow(retry_count);
+                    eprintln!(
+                        "   Error fetching content (attempt {} of {}): {}. Retrying in {}s...",
+                        retry_count + 1,
+                        max_retry,
+                        e,
+                        delay
+                    );
+                    sleep(Duration::from_secs(delay)).await;
+                }
+                Err(e) => {
+                    return Err(WallhavenClientError::RequestError(e.to_string()));
+                }
+            }
         }
+        unreachable!()
     }
 
     pub async fn download_image(
