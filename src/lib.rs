@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -11,18 +12,18 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::sleep;
 
+mod api;
+mod args;
 mod config;
 mod helper;
 mod lock;
-mod args;
-mod api;
 
 use lock::LockFile;
 
 use crate::helper::{get_key_from_config_or_env, update_wallpaper_list};
 
-pub use args::{Cli, Command};
 pub use api::{WallhavenClient, WallhavenClientError};
+pub use args::{Cli, Command};
 
 pub const WALLHAVEN_API: &str = "https://wallhaven.cc/api/v1/w";
 pub const WALLHAVEN_BASE: &str = "https://wallhaven.cc/w";
@@ -68,6 +69,7 @@ async fn process_wallpaper_optimized(
     config: &config::Config,
     wallpaper: &str,
     client: &Client,
+    show_progress: bool,
 ) -> Result<ProcessResult> {
     let img_link: String = if let Some(api_key) = config.api_key.as_deref() {
         let wallhaven_img_link = format!("{}/{}", WALLHAVEN_API, wallpaper.trim());
@@ -100,6 +102,7 @@ async fn process_wallpaper_optimized(
         &config.save_location,
         client,
         config.integrity,
+        show_progress,
     )
     .await
     {
@@ -257,69 +260,63 @@ impl RustPaper {
             println!("   All wallpapers are up to date.");
             return Ok(());
         }
-        let mut lock_file_updates = Vec::new();
-        let mut errors = 0;
-        let mut completed = 0;
+
         let total = needs_download.len();
+        let pb = ProgressBar::new(total as u64);
+        let style = ProgressStyle::with_template(
+            "{msg}\n{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})",
+        )
+        .unwrap()
+        .progress_chars("#>-");
+        pb.set_style(style);
+        pb.set_message("Downloading wallpapers");
+
+        let mut tasks = FuturesUnordered::new();
         for wallpaper in needs_download {
             let config = self.config.clone();
             let client = self.http_client.clone();
-            match process_wallpaper_optimized(&config, &wallpaper, &client).await {
-                Ok(result) => {
-                    completed += 1;
-                    if let Some(sha256) = result.sha256 {
-                        lock_file_updates.push((
-                            result.wallpaper_id,
-                            result.image_location,
-                            sha256,
-                        ));
+            let semaphore = self.download_semaphore.clone();
+            let pb_clone = pb.clone();
+
+            tasks.push(tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.expect("Semaphore closed");
+                let result = process_wallpaper_optimized(&config, &wallpaper, &client, false).await;
+                pb_clone.inc(1);
+                result
+            }));
+        }
+
+        let mut errors = 0;
+        let mut completed = 0;
+        let total = tasks.len();
+        let mut lock_file_updates = Vec::new();
+
+        while let Some(result) = tasks.next().await {
+            completed += 1;
+            match result {
+                Ok(Ok(process_result)) => {
+                    if self.config.integrity {
+                        if let Some(sha256) = process_result.sha256 {
+                            lock_file_updates.push((
+                                process_result.wallpaper_id,
+                                process_result.image_location,
+                                sha256,
+                            ));
+                        }
                     }
                 }
-                Err(_) => errors += 1,
+                Ok(Err(e)) => {
+                    eprintln!("❌ Error processing wallpaper: {}", e);
+                    errors += 1;
+                }
+                Err(e) => {
+                    eprintln!("❌ Task panicked: {}", e);
+                    errors += 1;
+                }
             }
         }
 
-        // let mut tasks = FuturesUnordered::new();
-        // for wallpaper in needs_download {
-        //     let config = self.config.clone();
-        //     let client = self.http_client.clone();
-        //     let semaphore = self.download_semaphore.clone();
-        //     tasks.push(tokio::spawn(async move {
-        //         // Acquire semaphore permit to limit concurrent downloads
-        //         let _permit = semaphore.acquire().await.expect("Semaphore closed");
-        //         process_wallpaper_optimized(&config, &wallpaper, &client).await
-        //     }));
-        // }
-        //
-        // let mut errors = 0;
-        // let mut completed = 0;
-        // let total = tasks.len();
-        // let mut lock_file_updates = Vec::new();
-        //
-        // while let Some(result) = tasks.next().await {
-        //     completed += 1;
-        //     match result {
-        //         Ok(Ok(process_result)) => {
-        //             if self.config.integrity {
-        //                 if let Some(sha256) = process_result.sha256 {
-        //                     lock_file_updates.push((
-        //                         process_result.wallpaper_id,
-        //                         process_result.image_location,
-        //                         sha256,
-        //                     ));
-        //                 }
-        //             }
-        //         }
-        //         Ok(Err(e)) => {
-        //             eprintln!("❌ Error processing wallpaper: {}", e);
-        //             errors += 1;
-        //         }
-        //         Err(e) => {
-        //             eprintln!("❌ Task panicked: {}", e);
-        //             errors += 1;
-        //         }
-        //     }
-        // }
+        pb.finish_with_message("Download complete");
         if self.config.integrity && !lock_file_updates.is_empty() {
             let mut lock_file_guard = self.lock_file.lock().await;
             if let Some(ref mut lock_file) = *lock_file_guard {

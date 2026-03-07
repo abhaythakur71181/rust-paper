@@ -235,6 +235,7 @@ pub async fn download_with_progress(
     save_location: &str,
     client: &Client,
     calculate_hash: bool,
+    show_progress: bool,
 ) -> Result<DownloadResult> {
     let url = reqwest::Url::parse(url).context("Invalid image URL")?;
     let response = client
@@ -255,14 +256,19 @@ pub async fn download_with_progress(
         .content_length()
         .ok_or_else(|| anyhow!("Failed to get content length"))?;
 
-    let pb = ProgressBar::new(total_size);
-    let style = ProgressStyle::with_template(
-        "{msg}\n{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})"
-    )
-    .unwrap()
-    .progress_chars("#>-");
-    pb.set_style(style);
-    pb.set_message(format!("Downloading {}", id));
+    let pb = if show_progress {
+        let pb = ProgressBar::new(total_size);
+        let style = ProgressStyle::with_template(
+            "{msg}\n{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+        )
+        .unwrap()
+        .progress_chars("#>-");
+        pb.set_style(style);
+        pb.set_message(format!("Downloading {}", id));
+        Some(pb)
+    } else {
+        None
+    };
 
     let file_path = PathBuf::from(save_location);
     tokio::fs::create_dir_all(&file_path)
@@ -302,8 +308,10 @@ pub async fn download_with_progress(
         .await
         .context("Error writing to file")?;
 
-    pb.set_position(total_size);
-    pb.finish_with_message(format!("Downloaded {}", id));
+    if let Some(ref pb) = pb {
+        pb.set_position(total_size);
+        pb.finish_with_message(format!("Downloaded {}", id));
+    }
 
     let sha256 = hasher.map(|h| format!("{:x}", h.finalize()));
 

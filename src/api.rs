@@ -290,6 +290,7 @@ impl WallhavenClient {
                             &self.rust_paper.config.save_location,
                             &self.http_client,
                             self.rust_paper.config.integrity,
+                            true,
                         )
                         .await
                         {

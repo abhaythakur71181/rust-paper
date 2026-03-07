@@ -30,7 +30,7 @@ impl Default for Config {
             save_location,
             integrity: true,
             api_key: None,
-            max_concurrent_downloads: 10,
+            max_concurrent_downloads: 3,
             timeout: 30,
             retry_count: 3,
         }
