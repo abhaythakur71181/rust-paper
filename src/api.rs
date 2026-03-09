@@ -1,6 +1,6 @@
-use crate::helper;
 use crate::RustPaper;
 use anyhow::{Context, Error};
+use futures::stream::{self, StreamExt};
 
 pub const BASE_URL: &str = "https://wallhaven.cc/api/v1";
 
@@ -172,9 +172,8 @@ pub(crate) trait Url {
     fn to_url(&self, base_url: &str) -> String;
 }
 
-use futures::stream::StreamExt;
 use futures::TryFutureExt;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::time::Duration;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -272,59 +271,63 @@ impl WallhavenClient {
                 // Check if response has the structure as described in api guide
                 let searchresp: SearchResponse = serde_json::from_str(&res)
                     .map_err(|e| WallhavenClientError::DecodeError(e.to_string()))?;
-
-                //download wallpapers
                 if s.download {
-                    use crate::helper::download_with_progress;
-
-                    println!(
-                        "  Found {} wallpaper(s), downloading to: {}\n",
-                        searchresp.data.len(),
-                        self.rust_paper.config.save_location
-                    );
+                    println!("  Found {} wallpaper(s)...", searchresp.data.len());
+                    let max_concurrent = self.rust_paper.config.max_concurrent_downloads as usize;
+                    let m = MultiProgress::new();
+                    let save_location = self.rust_paper.config.save_location.clone();
+                    let integrity = self.rust_paper.config.integrity;
+                    let client = self.http_client.clone();
+                    let mut tasks = stream::iter(searchresp.data.iter())
+                        .map(|w| {
+                            let save_loc = save_location.clone();
+                            let client = client.clone();
+                            let mp = m.clone();
+                            async move {
+                                let res = crate::helper::download_with_progress(
+                                    &w.path,
+                                    &w.id,
+                                    &save_loc,
+                                    &client,
+                                    integrity,
+                                    true,
+                                    Some(mp),
+                                )
+                                .await;
+                                (w, res)
+                            }
+                        })
+                        .buffer_unordered(max_concurrent);
 
                     let mut lock_updates = Vec::new();
-
-                    for w in &searchresp.data {
-                        match download_with_progress(
-                            &w.path,
-                            &w.id,
-                            &self.rust_paper.config.save_location,
-                            &self.http_client,
-                            self.rust_paper.config.integrity,
-                            true,
-                        )
-                        .await
-                        {
-                            Ok(result) => {
-                                println!("  ✓ Downloaded {} - {}", &w.id, &result.file_path);
-                                lock_updates.push((
-                                    w.id.clone(),
-                                    result.file_path,
-                                    result.sha256.clone(),
+                    while let Some((w, result)) = tasks.next().await {
+                        match result {
+                            Ok(dl_res) => {
+                                let _ = m.println(format!(
+                                    "  ✓ Downloaded {} - {}",
+                                    w.id, dl_res.file_path
                                 ));
-                                if let Some(hash) = &result.sha256 {
-                                    println!("    SHA256: {}", &hash);
-                                }
+                                lock_updates.push((w.id.clone(), dl_res.file_path, dl_res.sha256));
                             }
                             Err(e) => {
-                                eprintln!("  ✗ Failed to download {}: {}", w.id, e);
+                                let _ =
+                                    m.println(format!("  ✗ Failed to download {}: {}", w.id, e));
                             }
                         }
                     }
 
-                    // Update wallpapers.lst and lock file
+                    // Update lock file...
                     if !lock_updates.is_empty() {
-                        if let Err(e) = helper::update_wallpapers_list_and_lock(
+                        // Now `self` is free to be used here because it wasn't moved into the stream
+                        if let Err(e) = crate::helper::update_wallpapers_list_and_lock(
                             lock_updates,
                             &mut self.rust_paper,
                         )
                         .await
                         {
-                            eprintln!("  ⚠ Failed to update wallpapers list and lock file: {}", e);
+                            eprintln!("  ⚠ Failed to update lock file: {}", e);
                         }
                     }
-
                     String::from("\n  ✅ Download complete!")
                 } else {
                     format_search_results(&searchresp)

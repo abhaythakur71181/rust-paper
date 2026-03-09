@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Error, Result};
+use futures::StreamExt;
 use image::{self, guess_format, ImageFormat};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::{
@@ -131,102 +132,6 @@ pub async fn calculate_sha256(file_path: impl AsRef<Path>) -> Result<String> {
 }
 
 /// Download an image from a URL and save it to disk
-pub async fn download_image(
-    url: &str,
-    id: &str,
-    save_location: &str,
-    client: &Client,
-) -> Result<String> {
-    let url = reqwest::Url::parse(url).context("Invalid image URL")?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .context("Failed to download image")?;
-
-    let status = response.status();
-    if !status.is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to download image: HTTP {}",
-            status.as_u16()
-        ));
-    }
-
-    let img_bytes = response
-        .bytes()
-        .await
-        .context("Failed to read image bytes")?;
-
-    // Detect format to get the correct extension
-    let img_format = guess_format(&img_bytes).context("Failed to detect image format")?;
-
-    let image_name = format!(
-        "{}/{}.{}",
-        save_location,
-        id,
-        get_img_extension(&img_format)
-    );
-
-    // Save raw bytes directly to preserve integrity
-    tokio::fs::write(&image_name, &img_bytes)
-        .await
-        .context("Failed to save image")?;
-
-    Ok(image_name)
-}
-
-/// Download an image with SHA256 hashing support (for API downloads)
-pub async fn download_image_with_hash(
-    url: &str,
-    id: &str,
-    save_location: &str,
-    client: &Client,
-) -> Result<(String, String)> {
-    use sha2::{Digest, Sha256};
-
-    let url = reqwest::Url::parse(url).context("Invalid image URL")?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .context("Failed to download image")?;
-
-    let status = response.status();
-    if !status.is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to download image: HTTP {}",
-            status.as_u16()
-        ));
-    }
-
-    let img_bytes = response
-        .bytes()
-        .await
-        .context("Failed to read image bytes")?;
-
-    // Calculate SHA256 hash on raw bytes
-    let mut hasher = Sha256::new();
-    hasher.update(&img_bytes);
-    let hash = format!("{:x}", hasher.finalize());
-
-    // Detect format to get the correct extension
-    let img_format = guess_format(&img_bytes).context("Failed to detect image format")?;
-
-    let image_name = format!(
-        "{}/{}.{}",
-        save_location,
-        id,
-        get_img_extension(&img_format)
-    );
-
-    // Save raw bytes directly to preserve integrity
-    tokio::fs::write(&image_name, &img_bytes)
-        .await
-        .context("Failed to save image")?;
-
-    Ok((image_name, hash))
-}
-
 /// Unified download function with progress bar, hash calculation, and file saving
 /// Returns the saved file path and optional SHA256 hash
 pub async fn download_with_progress(
@@ -236,6 +141,7 @@ pub async fn download_with_progress(
     client: &Client,
     calculate_hash: bool,
     show_progress: bool,
+    multi_progress: Option<MultiProgress>,
 ) -> Result<DownloadResult> {
     let url = reqwest::Url::parse(url).context("Invalid image URL")?;
     let response = client
@@ -256,7 +162,18 @@ pub async fn download_with_progress(
         .content_length()
         .ok_or_else(|| anyhow!("Failed to get content length"))?;
 
-    let pb = if show_progress {
+    // --- Progress Bar Setup ---
+    let pb = if let Some(mp) = multi_progress {
+        let pb = mp.add(ProgressBar::new(total_size));
+        let style = ProgressStyle::with_template(
+            "{msg} {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+        )
+        .unwrap()
+        .progress_chars("#>-");
+        pb.set_style(style);
+        pb.set_message(format!("Downloading {}", id));
+        Some(pb)
+    } else if show_progress {
         let pb = ProgressBar::new(total_size);
         let style = ProgressStyle::with_template(
             "{msg}\n{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
@@ -269,51 +186,50 @@ pub async fn download_with_progress(
     } else {
         None
     };
+    let mut downloaded_data = Vec::with_capacity(total_size as usize);
+    let mut stream = response.bytes_stream();
+    let mut downloaded: u64 = 0;
+
+    while let Some(item) = stream.next().await {
+        let chunk = item.context("Error while downloading file")?;
+        downloaded_data.extend_from_slice(&chunk);
+        let new = std::cmp::min(downloaded + (chunk.len() as u64), total_size);
+        downloaded = new;
+        if let Some(ref pb) = pb {
+            pb.set_position(new);
+        }
+    }
+    if let Some(ref pb) = pb {
+        pb.finish_and_clear();
+    }
 
     let file_path = PathBuf::from(save_location);
     tokio::fs::create_dir_all(&file_path)
         .await
         .context("Failed to create save directory")?;
-
-    // Download all bytes first to detect format
-    let img_bytes = response
-        .bytes()
-        .await
-        .context("Failed to read image bytes")?;
-
-    // Detect format to get the correct extension
-    let img_format = guess_format(&img_bytes).context("Failed to detect image format")?;
+    let img_format = guess_format(&downloaded_data).context("Failed to detect image format")?;
     let extension = get_img_extension(&img_format);
-
     let file_name = format!("{}/{}.{}", save_location, id, extension);
     let file_path_ref = Path::new(&file_name);
-
-    let mut file = tokio::fs::File::create(file_path_ref)
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(file_path_ref)
         .await
         .context("Failed to create file")?;
-
-    let mut hasher = if calculate_hash {
-        Some(Sha256::new())
-    } else {
-        None
-    };
-
-    // Calculate hash on the bytes we already have
-    if let Some(ref mut h) = hasher {
-        h.update(&img_bytes);
-    }
-
-    // Write to file
-    file.write_all(&img_bytes)
+    file.write_all(&downloaded_data)
         .await
         .context("Error writing to file")?;
 
-    if let Some(ref pb) = pb {
-        pb.set_position(total_size);
-        pb.finish_with_message(format!("Downloaded {}", id));
-    }
-
-    let sha256 = hasher.map(|h| format!("{:x}", h.finalize()));
+    // Calculate Hash if requested
+    let sha256 = if calculate_hash {
+        let mut hasher = Sha256::new();
+        hasher.update(&downloaded_data);
+        Some(format!("{:x}", hasher.finalize()))
+    } else {
+        None
+    };
 
     Ok(DownloadResult {
         file_path: file_name,

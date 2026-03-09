@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use futures::stream::{FuturesUnordered, StreamExt};
-use indicatif::{ProgressBar, ProgressStyle};
+use futures::stream::{self, FuturesUnordered, StreamExt};
+use indicatif::MultiProgress;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -70,6 +70,7 @@ async fn process_wallpaper_optimized(
     wallpaper: &str,
     client: &Client,
     show_progress: bool,
+    multi_progress: Option<MultiProgress>,
 ) -> Result<ProcessResult> {
     let img_link: String = if let Some(api_key) = config.api_key.as_deref() {
         let wallhaven_img_link = format!("{}/{}", WALLHAVEN_API, wallpaper.trim());
@@ -103,25 +104,16 @@ async fn process_wallpaper_optimized(
         client,
         config.integrity,
         show_progress,
+        multi_progress,
     )
     .await
     {
-        Ok(result) => {
-            println!("  ✓ Downloaded {} - {}", &wallpaper, &result.file_path);
-            if let Some(hash) = &result.sha256 {
-                println!("    SHA256: {}", &hash);
-            }
-            println!("✔️ Downloaded {}", wallpaper);
-            Ok(ProcessResult {
-                wallpaper_id: wallpaper.to_string(),
-                image_location: result.file_path,
-                sha256: result.sha256,
-            })
-        }
-        Err(e) => {
-            eprintln!("  ✗ Failed to download {}: {}", &wallpaper, e);
-            Err(anyhow::anyhow!("Failed to download {}: {}", &wallpaper, e))
-        }
+        Ok(result) => Ok(ProcessResult {
+            wallpaper_id: wallpaper.to_string(),
+            image_location: result.file_path,
+            sha256: result.sha256,
+        }),
+        Err(e) => Err(anyhow::anyhow!("Failed to download {}: {}", &wallpaper, e)),
     }
 }
 
@@ -260,41 +252,37 @@ impl RustPaper {
             println!("   All wallpapers are up to date.");
             return Ok(());
         }
+        println!("Downloading {} wallpapers...", needs_download.len());
 
-        let total = needs_download.len();
-        let pb = ProgressBar::new(total as u64);
-        let style = ProgressStyle::with_template(
-            "{msg}\n{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})",
-        )
-        .unwrap()
-        .progress_chars("#>-");
-        pb.set_style(style);
-        pb.set_message("Downloading wallpapers");
-
-        let mut tasks = FuturesUnordered::new();
-        for wallpaper in needs_download {
-            let config = self.config.clone();
-            let client = self.http_client.clone();
-            let semaphore = self.download_semaphore.clone();
-            let pb_clone = pb.clone();
-
-            tasks.push(tokio::spawn(async move {
-                let _permit = semaphore.acquire().await.expect("Semaphore closed");
-                let result = process_wallpaper_optimized(&config, &wallpaper, &client, false).await;
-                pb_clone.inc(1);
-                result
-            }));
-        }
+        // --- FIX STARTS HERE ---
+        let max_concurrent = self.config.max_concurrent_downloads as usize;
+        let m = MultiProgress::new(); // Supervisor for all bars
+        let mut tasks = stream::iter(needs_download.iter())
+            .map(|w| {
+                let client = self.http_client.clone();
+                let config = self.config.clone();
+                let mp = m.clone();
+                async move {
+                    let res =
+                        process_wallpaper_optimized(&config, w, &client, true, Some(mp)).await;
+                    (w, res)
+                }
+            })
+            .buffer_unordered(max_concurrent);
 
         let mut errors = 0;
         let mut completed = 0;
-        let total = tasks.len();
+        let total = needs_download.len();
         let mut lock_file_updates = Vec::new();
 
-        while let Some(result) = tasks.next().await {
+        while let Some((w, result)) = tasks.next().await {
             completed += 1;
             match result {
-                Ok(Ok(process_result)) => {
+                Ok(process_result) => {
+                    let _ = m.println(format!(
+                        "  ✓ Downloaded {} - {}",
+                        w, process_result.image_location
+                    ));
                     if self.config.integrity {
                         if let Some(sha256) = process_result.sha256 {
                             lock_file_updates.push((
@@ -305,18 +293,13 @@ impl RustPaper {
                         }
                     }
                 }
-                Ok(Err(e)) => {
-                    eprintln!("❌ Error processing wallpaper: {}", e);
-                    errors += 1;
-                }
                 Err(e) => {
-                    eprintln!("❌ Task panicked: {}", e);
+                    let _ = m.println(format!("  ✗ Failed: {}", e));
                     errors += 1;
                 }
             }
         }
 
-        pb.finish_with_message("Download complete");
         if self.config.integrity && !lock_file_updates.is_empty() {
             let mut lock_file_guard = self.lock_file.lock().await;
             if let Some(ref mut lock_file) = *lock_file_guard {
@@ -331,6 +314,8 @@ impl RustPaper {
                 "✔️ Completed {} of {} with {} error(s)",
                 completed, total, errors
             );
+        } else {
+            println!("\n ✅ Sync complete!");
         }
 
         Ok(())
