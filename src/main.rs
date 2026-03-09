@@ -2,7 +2,7 @@ use anyhow::Error;
 use clap::Parser;
 use rust_paper::{Cli, Command, RustPaper, WallhavenClient};
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 100)]
+#[tokio::main]
 async fn main() -> Result<(), Error> {
     let cli = Cli::parse();
 
