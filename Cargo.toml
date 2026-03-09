@@ -1,6 +1,6 @@
 [package]
 name = "rust-paper"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 categories = ["command-line-utilities", "parsing", "parser-implementations", "asynchronous", "no-std"]
 description = "Rust Wallpaper manager from ( https://wallhaven.cc/ ) for Linux/UNIX only"
