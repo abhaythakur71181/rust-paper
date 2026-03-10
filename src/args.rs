@@ -204,8 +204,7 @@ pub struct SearchArgs {
 
     /// Seed
     ///
-    ///     Optional seed for random results
-    ///     [a-zA-Z0-9]{6}
+    /// Optional seed for random results (6 alphanumeric characters) [a-zA-Z0-9]{6}
     #[clap(long,
            verbatim_doc_comment,
            help_heading = Some("SEARCH PREFERENCES"),
